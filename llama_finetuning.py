@@ -7,7 +7,6 @@ from typing import List, Union
 
 import fire
 import torch
-import transformers
 from datasets import load_dataset
 import os.path as osp
 from tqdm import tqdm
@@ -15,12 +14,8 @@ from tqdm import tqdm
 # Unused imports removed
 from utils import fsdp_auto_wrap_policy
 from transformers import (
-    LlamaForCausalLM,
-    LlamaTokenizer,
     AutoModelForCausalLM,
-    AutoModelForSeq2SeqLM,
     AutoTokenizer,
-    default_data_collator,
     BitsAndBytesConfig
 )
 import torch.distributed as dist
@@ -48,98 +43,189 @@ from utils.config_utils import (
     generate_peft_config,
     generate_dataset_config,
 )
-from peft import get_peft_model, TaskType, prepare_model_for_int8_training
+from peft import get_peft_model
 import configs
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    MixedPrecision,
-)
-from torch.utils.data import DistributedSampler
+
 import policies
 from policies import AnyPrecisionAdamW
 from configs import fsdp_config, train_config
 import torch.optim as optim
-from torch.optim.lr_scheduler import StepLR
-from pkg_resources import packaging
 import torch
 import torch.cuda.nccl as nccl
 import torch.distributed as dist
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+import argparse
+import bitsandbytes as bnb
+from functools import partial
+import os
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, AutoPeftModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed, Trainer, TrainingArguments, BitsAndBytesConfig, \
+    DataCollatorForLanguageModeling, Trainer, TrainingArguments
 
+
+def create_bnb_config():
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
+
+    return bnb_config
+
+def create_peft_config(modules):
+    """
+    Create Parameter-Efficient Fine-Tuning config for your model
+    :param modules: Names of the modules to apply Lora to
+    """
+    config = LoraConfig(
+        r=16,  # dimension of the updated matrices
+        lora_alpha=64,  # parameter for scaling
+        target_modules=modules,
+        lora_dropout=0.1,  # dropout probability for layers
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+
+    return config
+
+
+def find_all_linear_names(model):
+    cls = bnb.nn.Linear4bit #if args.bits == 4 else (bnb.nn.Linear8bitLt if args.bits == 8 else torch.nn.Linear)
+    lora_module_names = set()
+    for name, module in model.named_modules():
+        if isinstance(module, cls):
+            names = name.split('.')
+            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+
+    if 'lm_head' in lora_module_names:  # needed for 16-bit
+        lora_module_names.remove('lm_head')
+    return list(lora_module_names)
+
+def print_trainable_parameters(model, use_4bit=False):
+    """
+    Prints the number of trainable parameters in the model.
+    """
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        num_params = param.numel()
+        # if using DS Zero 3 and the weights are initialized empty
+        if num_params == 0 and hasattr(param, "ds_numel"):
+            num_params = param.ds_numel
+
+        all_param += num_params
+        if param.requires_grad:
+            trainable_params += num_params
+    if use_4bit:
+        trainable_params /= 2
+    print(
+        f"all params: {all_param:,d} || trainable params: {trainable_params:,d} || trainable%: {100 * trainable_params / all_param}"
+    )
+
+def load_model(model_name, bnb_config):
+    print('Load model: ' + model_name)
+    n_gpus = torch.cuda.device_count()
+    max_memory = f'{22888}MB'
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config=bnb_config,
+        device_map="auto", # dispatch efficiently the model on the available ressources
+        max_memory = {i: max_memory for i in range(n_gpus)},
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_auth_token=True)
+
+    # Needed for LLaMA tokenizer
+    tokenizer.pad_token = tokenizer.eos_token
+
+    return model, tokenizer
+
+
+def train(model, tokenizer, dataset, output_dir):
+    # Apply preprocessing to the model to prepare it by
+    # 1 - Enabling gradient checkpointing to reduce memory usage during fine-tuning
+    model.gradient_checkpointing_enable()
+
+    # 2 - Using the prepare_model_for_kbit_training method from PEFT
+    model = prepare_model_for_kbit_training(model)
+
+    # Get lora module names
+    modules = find_all_linear_names(model)
+
+    # Create PEFT config for these modules and wrap the model to PEFT
+    peft_config = create_peft_config(modules)
+    model = get_peft_model(model, peft_config)
+    
+    # Print information about the percentage of trainable parameters
+    print_trainable_parameters(model)
+    
+    # Training parameters
+    trainer = Trainer(
+        model=model,
+        train_dataset=dataset,
+        args=TrainingArguments(
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=4,
+            warmup_steps=2,
+            max_steps=20,
+            learning_rate=2e-4,
+            fp16=True,
+            logging_steps=1,
+            output_dir="outputs",
+            optim="paged_adamw_8bit",
+        ),
+        data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False)
+    )
+    
+    model.config.use_cache = False  # re-enable for inference to speed up predictions for similar inputs
+    
+    ### SOURCE https://github.com/artidoro/qlora/blob/main/qlora.py
+    # Verifying the datatypes before training
+    
+    dtypes = {}
+    for _, p in model.named_parameters():
+        dtype = p.dtype
+        if dtype not in dtypes: dtypes[dtype] = 0
+        dtypes[dtype] += p.numel()
+    total = 0
+    for k, v in dtypes.items(): total+= v
+    for k, v in dtypes.items():
+        print(k, v, v/total)
+     
+    do_train = True
+    
+    # Launch training
+    print("Training...")
+    
+    if do_train:
+        train_result = trainer.train()
+        metrics = train_result.metrics
+        trainer.log_metrics("train", metrics)
+        trainer.save_metrics("train", metrics)
+        trainer.save_state()
+        print(metrics)    
+    
+    ###
+    
+    # Saving model
+    print("Saving last checkpoint of the model...")
+    os.makedirs(output_dir, exist_ok=True)
+    trainer.model.save_pretrained(output_dir)
+    
+    # Free memory for merging weights
+    del model
+    del trainer
+    torch.cuda.empty_cache()
 
 def main(**kwargs):
-    # Update the configuration for the training and sharding process
-    update_config((train_config, fsdp_config), **kwargs)
 
     # Set the seeds for reproducibility
     torch.cuda.manual_seed(train_config.seed)
     torch.manual_seed(train_config.seed)
 
-    if train_config.enable_fsdp:
-        setup()
-        # torchrun specific
-        local_rank = int(os.environ["LOCAL_RANK"])
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
+    bnb_config = create_bnb_config()
 
-    if torch.distributed.is_initialized():
-        torch.cuda.set_device(rank)
-        setup_environ_flags(rank)
-    
-    # Calculate gradient accumulation steps
-    gradient_accumulation_steps = train_config.batch_size_training // train_config.micro_batch_size
-     
-    # Load the pre-trained model and setup its configuration
-    model = LlamaForCausalLM.from_pretrained(
-        train_config.model_name,
-        load_in_8bit=True if train_config.quantization else None,
-        device_map="auto" if train_config.quantization else None,
-    )
-    
-    print_model_size(model, train_config, rank if train_config.enable_fsdp else 0)
-    
-    # Prepare the model for int8 training if quantization is enabled
-    if train_config.quantization:
-        model = prepare_model_for_int8_training(model)
-        
-    # Convert the model to bfloat16 if fsdp and pure_bf16 is enabled
-    if train_config.enable_fsdp and fsdp_config.pure_bf16:
-        model.to(torch.bfloat16)
-
-    # Load the tokenizer and add special tokens
-    tokenizer = LlamaTokenizer.from_pretrained(train_config.model_name)
-    tokenizer.add_special_tokens(
-            {
-            
-                "pad_token": "<PAD>",
-            }
-        )
-    if train_config.use_peft:
-        peft_config = generate_peft_config(train_config, kwargs)
-        model = get_peft_model(model, peft_config)
-        model.print_trainable_parameters()
-    
-    #setting up FSDP if enable_fsdp is enabled
-    if train_config.enable_fsdp:
-        if not train_config.use_peft and train_config.freeze_layers:
-            
-            freeze_transformer_layers(train_config.num_freeze_layers)
-
-        mixed_precision_policy, wrapping_policy = get_policies(fsdp_config, rank)
-        my_auto_wrapping_policy = fsdp_auto_wrap_policy(model, LlamaDecoderLayer)
-   
-        model = FSDP(
-            model,
-            auto_wrap_policy= my_auto_wrapping_policy if train_config.use_peft else wrapping_policy,
-            mixed_precision=mixed_precision_policy if not fsdp_config.pure_bf16 else None,
-            sharding_strategy=fsdp_config.sharding_strategy,
-            device_id=torch.cuda.current_device(),
-            limit_all_gathers=False,
-        )
-        if fsdp_config.fsdp_activation_checkpointing:
-            policies.apply_fsdp_checkpointing(model)
-    elif not train_config.quantization and not train_config.enable_fsdp:
-        model.to("cuda")
+    model, tokenizer = load_model('./llama2-transformed/', bnb_config)
 
     dataset_config = generate_dataset_config(train_config, kwargs)
     
@@ -150,88 +236,25 @@ def main(**kwargs):
         split="train",
     )
     
-    if not train_config.enable_fsdp or rank == 0:
-        print(f"--> Training Set Length = {len(dataset_train)}")
+    print(f"--> Training Set Length = {len(dataset_train)}")
 
     dataset_val = get_preprocessed_dataset(
         tokenizer,
         dataset_config,
         split="test",
     )
-    if not train_config.enable_fsdp or rank == 0:
-            print(f"--> Validation Set Length = {len(dataset_val)}")
+    print(f"--> Validation Set Length = {len(dataset_val)}")
 
-    train_sampler = None
-    val_sampler = None
-    if train_config.enable_fsdp:
-        train_sampler = DistributedSampler(
-            dataset_train,
-            rank=dist.get_rank(),
-            num_replicas=dist.get_world_size(),
-            shuffle=True,
-        )
-        if train_config.run_validation:
-            val_sampler = DistributedSampler(
-                dataset_val,
-                rank=dist.get_rank(),
-                num_replicas=dist.get_world_size(),
-            )
-        
-    # Create DataLoaders for the training and validation dataset
-    train_dataloader = torch.utils.data.DataLoader(
-        dataset_train,
-        batch_size=train_config.batch_size_training,
-        num_workers=train_config.num_workers_dataloader,
-        pin_memory=True,
-        sampler=train_sampler if train_sampler else None,
-        drop_last=True,
-        collate_fn=default_data_collator,
-    )
+    train(model, tokenizer, dataset_train, train_config.output_dir)
+    
+    #model should be deleted in training
+    model = AutoPeftModelForCausalLM.from_pretrained(train_config.output_dir, device_map="auto", torch_dtype=torch.bfloat16)
+    model = model.merge_and_unload()
 
-    if train_config.run_validation:
-        eval_dataloader = torch.utils.data.DataLoader(
-            dataset_val,
-            batch_size=train_config.val_batch_size,
-            num_workers=train_config.num_workers_dataloader,
-            pin_memory=True,
-            sampler=val_sampler if val_sampler else None,
-            drop_last=True,
-            collate_fn=default_data_collator,
-        )
-        
-    # Initialize the optimizer and learning rate scheduler
-    if fsdp_config.pure_bf16 and fsdp_config.optimizer == "anyprecision":
-        optimizer = AnyPrecisionAdamW(
-            model.parameters(),
-            lr=train_config.lr,
-            momentum_dtype=torch.bfloat16,
-            variance_dtype=torch.bfloat16,
-            use_kahan_summation=False,
-        )
-    else:
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=train_config.lr,
-            weight_decay=0.0,
-        )
-    scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
-
-    # Start the training process
-    results = train(
-        model,
-        train_dataloader,
-        eval_dataloader, 
-        tokenizer,
-        optimizer,
-        scheduler,
-        gradient_accumulation_steps,
-        train_config,
-        fsdp_config if train_config.enable_fsdp else None,
-        local_rank if train_config.enable_fsdp else None,
-        rank if train_config.enable_fsdp else None,
-    )
-    if not train_config.enable_fsdp or rank==0:
-        [print(f'Key: {k}, Value: {v}') for k, v in results.items()]
+    output_merged_dir = "results/llama2/final_merged_checkpoint"
+    os.makedirs(output_merged_dir, exist_ok=True)
+    model.save_pretrained(output_merged_dir, safe_serialization=True)
+    tokenizer.save_pretrained(output_merged_dir)
 
 if __name__ == "__main__":
     fire.Fire(main)
