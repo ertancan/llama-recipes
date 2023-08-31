@@ -21,12 +21,14 @@ def update_config(config, **kwargs):
     else:
         for k, v in kwargs.items():
             if hasattr(config, k):
+                print('Setting ' + k + ' to: ' + v)
                 setattr(config, k, v)
             elif "." in k:
                 # allow --some_config.some_param=True
                 config_name, param_name = k.split(".")
                 if type(config).__name__ == config_name:
                     if hasattr(config, param_name):
+                        print('Setting ' + param_name + ' to: ' + v)
                         setattr(config, param_name, v)
                     else:
                         # In case of specialized config we can warm user

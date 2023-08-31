@@ -6,6 +6,6 @@ from dataclasses import dataclass
 @dataclass
 class cloudf6s_dataset:
     dataset: str = "cloudf6s_dataset"
-    train_split: str = "output/training/data.json" 
-    test_split: str = "output/validation/data.json"
-    input_length: int = 2048
+    train_split: str = "train" 
+    test_split: str = "test"
+    input_length: int = 4096

@@ -165,13 +165,10 @@ def train(model, tokenizer, dataset, eval_dataset, output_dir):
         train_dataset=dataset,
         eval_dataset=eval_dataset,
         args=TrainingArguments(
-            per_device_train_batch_size=1,
             gradient_accumulation_steps=4,
-            num_train_epochs=3,
+            num_train_epochs=18,
             warmup_steps=2,
-            max_steps=20,
             learning_rate=2e-4,
-            fp16=True,
             logging_steps=1,
             output_dir="outputs",
             optim="paged_adamw_8bit",
@@ -220,15 +217,10 @@ def train(model, tokenizer, dataset, eval_dataset, output_dir):
     torch.cuda.empty_cache()
 
 def main(**kwargs):
-
-    # Set the seeds for reproducibility
-    torch.cuda.manual_seed(train_config.seed)
-    torch.manual_seed(train_config.seed)
-
+    print('Merging the configs')
+    update_config((train_config, fsdp_config), **kwargs)
     bnb_config = create_bnb_config()
-
-    model, tokenizer = load_model('./llama2-transformed/', bnb_config)
-
+    model, tokenizer = load_model(train_config.model_name, bnb_config)
     dataset_config = generate_dataset_config(train_config, kwargs)
     
      # Load and preprocess the dataset for training and validation
@@ -246,6 +238,12 @@ def main(**kwargs):
         split="test",
     )
     print(f"--> test Set Length = {len(dataset_test)}")
+
+    # Set the seeds for reproducibility
+    torch.cuda.manual_seed(train_config.seed)
+    torch.manual_seed(train_config.seed)
+
+
 
     train(model, tokenizer, dataset_train, dataset_test, train_config.output_dir)
     

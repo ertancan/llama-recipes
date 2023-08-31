@@ -13,17 +13,14 @@ from torch.utils.data import Dataset
 from typing import List
 
 class CloudF6sDataset(Dataset):
-    # TODO: modify the prompt
-    prompt = (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{prompt}\n\n### Response:"
-    )
+    
+    prompt = "{prompt}" # Prompt is already integrated into the data
     def __init__(self, dataset_config, tokenizer, split="train", max_words = 4096):
+        print('Requested split for ' + split)
         if split == 'train':
-            filename = 'training_data/training/data.json'
+            filename = './training_data/training/data.json'
         else:
-            filename = 'training_data/validation/data.json'
+            filename = './training_data/test/data.json'
         self.max_words = max_words
         self.examples = json.load(open(filename))
 
