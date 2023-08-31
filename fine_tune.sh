@@ -2,8 +2,9 @@ python3 -m pip install --upgrade pip
 pip install awscli
 aws configure
 
-aws s3 cp s3://llama2-transformed-ertan/llama2-transformed/ ./llama2-transformed/ --recursive
+aws s3 cp s3://llama2-chat-transformed/llama2-transformed/ ./llama2-transformed/ --recursive
 aws s3 cp s3://forensic-training-data/ ./training_data/ --recursive
+
 pip install -r llama-recipes/requirements.txt
 
 export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
