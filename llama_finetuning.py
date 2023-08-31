@@ -64,10 +64,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed, Trainer,
 
 def create_bnb_config():
     bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        load_in_8bit=True,
+        llm_int8_threshold=6.0,
+        llm_int8_has_fp16_weight=False,
     )
 
     return bnb_config
@@ -170,6 +169,7 @@ def train(model, tokenizer, dataset, eval_dataset, output_dir):
             warmup_steps=2,
             learning_rate=2e-4,
             logging_steps=1,
+            fp16=True,
             output_dir="outputs",
             optim="paged_adamw_8bit",
         ),
@@ -248,7 +248,11 @@ def main(**kwargs):
     train(model, tokenizer, dataset_train, dataset_test, train_config.output_dir)
     
     #model should be deleted in training
-    model = AutoPeftModelForCausalLM.from_pretrained(train_config.output_dir, device_map="auto", torch_dtype=torch.bfloat16)
+    model = AutoPeftModelForCausalLM.from_pretrained(train_config.output_dir, 
+                                                     device_map="auto", 
+                                                     load_in_8bit = True,
+
+                                                     torch_dtype=torch.bfloat16)
     model = model.merge_and_unload()
 
     output_merged_dir = "results/llama2/final_merged_checkpoint"
