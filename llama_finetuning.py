@@ -141,7 +141,7 @@ def load_model(model_name, bnb_config):
     return model, tokenizer
 
 
-def train(model, tokenizer, dataset, output_dir):
+def train(model, tokenizer, dataset, eval_dataset, output_dir):
     # Apply preprocessing to the model to prepare it by
     # 1 - Enabling gradient checkpointing to reduce memory usage during fine-tuning
     model.gradient_checkpointing_enable()
@@ -163,9 +163,11 @@ def train(model, tokenizer, dataset, output_dir):
     trainer = Trainer(
         model=model,
         train_dataset=dataset,
+        eval_dataset=eval_dataset,
         args=TrainingArguments(
             per_device_train_batch_size=1,
             gradient_accumulation_steps=4,
+            num_train_epochs=3,
             warmup_steps=2,
             max_steps=20,
             learning_rate=2e-4,
@@ -238,14 +240,14 @@ def main(**kwargs):
     
     print(f"--> Training Set Length = {len(dataset_train)}")
 
-    dataset_val = get_preprocessed_dataset(
+    dataset_test = get_preprocessed_dataset(
         tokenizer,
         dataset_config,
         split="test",
     )
-    print(f"--> Validation Set Length = {len(dataset_val)}")
+    print(f"--> test Set Length = {len(dataset_test)}")
 
-    train(model, tokenizer, dataset_train, train_config.output_dir)
+    train(model, tokenizer, dataset_train, dataset_test, train_config.output_dir)
     
     #model should be deleted in training
     model = AutoPeftModelForCausalLM.from_pretrained(train_config.output_dir, device_map="auto", torch_dtype=torch.bfloat16)
