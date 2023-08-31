@@ -63,10 +63,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed, Trainer,
 
 
 def create_bnb_config():
+    bits = 4
     bnb_config = BitsAndBytesConfig(
-        load_in_8bit=True,
-        llm_int8_threshold=6.0,
-        llm_int8_has_fp16_weight=False,
+            load_in_4bit=bits == 4,
+            load_in_8bit=bits == 8,
+            llm_int8_threshold=6.0,
+            llm_int8_has_fp16_weight=False,
+            bnb_4bit_compute_dtype=torch.float16 ,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
     )
 
     return bnb_config
@@ -89,7 +94,7 @@ def create_peft_config(modules):
 
 
 def find_all_linear_names(model):
-    cls = bnb.nn.Linear4bit #if args.bits == 4 else (bnb.nn.Linear8bitLt if args.bits == 8 else torch.nn.Linear)
+    cls = bnb.nn.Linear8bitLt #if args.bits == 4 else (bnb.nn.Linear8bitLt if args.bits == 8 else torch.nn.Linear)
     lora_module_names = set()
     for name, module in model.named_modules():
         if isinstance(module, cls):
@@ -250,8 +255,7 @@ def main(**kwargs):
     #model should be deleted in training
     model = AutoPeftModelForCausalLM.from_pretrained(train_config.output_dir, 
                                                      device_map="auto", 
-                                                     load_in_8bit = True,
-
+                                                     load_in_4bit = True,
                                                      torch_dtype=torch.bfloat16)
     model = model.merge_and_unload()
 
