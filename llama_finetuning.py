@@ -131,7 +131,8 @@ def load_model(model_name, bnb_config: BitsAndBytesConfig):
     print('Load model: ' + model_name)
     print('Number of GPUs: ' + str(n_gpus))
     print('Max memory: ' + str(max_memory))
-
+    print('Load in 4bit: ' + str(True if bnb_config.load_in_4bit else False))
+    print('Load in 8bit: ' + str(True if bnb_config.load_in_8bit else False))
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=bnb_config,
@@ -141,10 +142,11 @@ def load_model(model_name, bnb_config: BitsAndBytesConfig):
         load_in_8bit = True if bnb_config.load_in_8bit else False,
         torch_dtype=torch.bfloat16
     )
+    print('Model loaded')
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_auth_token=True, 
                                               use_fast=False  # Complains about the fast tokenizer
                                               )
-
+    print('Tokenizer loaded')
     # Needed for LLaMA tokenizer
     tokenizer.pad_token = tokenizer.eos_token
 

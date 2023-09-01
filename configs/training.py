@@ -10,7 +10,7 @@ class train_config:
     enable_fsdp: bool= False 
     run_validation: bool=True
     batch_size_training: int=4
-    num_epochs: int=3
+    num_epochs: int=18
     num_workers_dataloader: int=1
     lr: float=1e-4
     weight_decay: float=0.0
