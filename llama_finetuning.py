@@ -62,11 +62,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed, Trainer,
     DataCollatorForLanguageModeling, Trainer, TrainingArguments
 
 
-def create_bnb_config():
-    bits = 4
+def create_bnb_config(bits=4):
     bnb_config = BitsAndBytesConfig(
-            load_in_4bit=bits == 4,
-            load_in_8bit=bits == 8,
+            load_in_4bit= bits == 4,
+            load_in_8bit= bits == 8,
             llm_int8_threshold=6.0,
             llm_int8_has_fp16_weight=False,
             bnb_4bit_compute_dtype=torch.float16 ,
@@ -93,8 +92,8 @@ def create_peft_config(modules):
     return config
 
 
-def find_all_linear_names(model):
-    cls = bnb.nn.Linear8bitLt #if args.bits == 4 else (bnb.nn.Linear8bitLt if args.bits == 8 else torch.nn.Linear)
+def find_all_linear_names(model, bits = 4):
+    cls = bnb.nn.Linear4bit if bits == 4 else (bnb.nn.Linear8bitLt if bits == 8 else torch.nn.Linear)
     lora_module_names = set()
     for name, module in model.named_modules():
         if isinstance(module, cls):
@@ -126,18 +125,25 @@ def print_trainable_parameters(model, use_4bit=False):
         f"all params: {all_param:,d} || trainable params: {trainable_params:,d} || trainable%: {100 * trainable_params / all_param}"
     )
 
-def load_model(model_name, bnb_config):
-    print('Load model: ' + model_name)
+def load_model(model_name, bnb_config: BitsAndBytesConfig):
     n_gpus = torch.cuda.device_count()
     max_memory = f'{22888}MB'
+    print('Load model: ' + model_name)
+    print('Number of GPUs: ' + str(n_gpus))
+    print('Max memory: ' + str(max_memory))
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=bnb_config,
         device_map="auto", # dispatch efficiently the model on the available ressources
         max_memory = {i: max_memory for i in range(n_gpus)},
+        load_in_4bit = True if bnb_config.load_in_4bit else False,
+        load_in_8bit = True if bnb_config.load_in_8bit else False,
+        torch_dtype=torch.bfloat16
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_auth_token=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_auth_token=True, 
+                                              use_fast=False  # Complains about the fast tokenizer
+                                              )
 
     # Needed for LLaMA tokenizer
     tokenizer.pad_token = tokenizer.eos_token
@@ -145,7 +151,7 @@ def load_model(model_name, bnb_config):
     return model, tokenizer
 
 
-def train(model, tokenizer, dataset, eval_dataset, output_dir):
+def train(model, tokenizer, dataset, eval_dataset, output_dir, bits=4):
     # Apply preprocessing to the model to prepare it by
     # 1 - Enabling gradient checkpointing to reduce memory usage during fine-tuning
     model.gradient_checkpointing_enable()
@@ -154,7 +160,7 @@ def train(model, tokenizer, dataset, eval_dataset, output_dir):
     model = prepare_model_for_kbit_training(model)
 
     # Get lora module names
-    modules = find_all_linear_names(model)
+    modules = find_all_linear_names(model, bits=bits)
 
     # Create PEFT config for these modules and wrap the model to PEFT
     peft_config = create_peft_config(modules)
@@ -170,7 +176,7 @@ def train(model, tokenizer, dataset, eval_dataset, output_dir):
         eval_dataset=eval_dataset,
         args=TrainingArguments(
             gradient_accumulation_steps=4,
-            num_train_epochs=18,
+            num_train_epochs=10,
             warmup_steps=2,
             learning_rate=2e-4,
             logging_steps=1,
@@ -196,18 +202,16 @@ def train(model, tokenizer, dataset, eval_dataset, output_dir):
     for k, v in dtypes.items():
         print(k, v, v/total)
      
-    do_train = True
     
     # Launch training
     print("Training...")
     
-    if do_train:
-        train_result = trainer.train()
-        metrics = train_result.metrics
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
-        trainer.save_state()
-        print(metrics)    
+    train_result = trainer.train()
+    metrics = train_result.metrics
+    trainer.log_metrics("train", metrics)
+    trainer.save_metrics("train", metrics)
+    trainer.save_state()
+    print(metrics)    
     
     ###
     
@@ -217,6 +221,7 @@ def train(model, tokenizer, dataset, eval_dataset, output_dir):
     trainer.model.save_pretrained(output_dir)
     
     # Free memory for merging weights
+    # TODO: we actually don't merge and save tho
     del model
     del trainer
     torch.cuda.empty_cache()
@@ -224,7 +229,8 @@ def train(model, tokenizer, dataset, eval_dataset, output_dir):
 def main(**kwargs):
     print('Merging the configs')
     update_config((train_config, fsdp_config), **kwargs)
-    bnb_config = create_bnb_config()
+    bits = kwargs.get('bits', 4)
+    bnb_config = create_bnb_config(bits=bits)
     model, tokenizer = load_model(train_config.model_name, bnb_config)
     dataset_config = generate_dataset_config(train_config, kwargs)
     
@@ -250,12 +256,13 @@ def main(**kwargs):
 
 
 
-    train(model, tokenizer, dataset_train, dataset_test, train_config.output_dir)
+    train(model, tokenizer, dataset_train, dataset_test, train_config.output_dir, bits=bits)
     
     #model should be deleted in training
     model = AutoPeftModelForCausalLM.from_pretrained(train_config.output_dir, 
                                                      device_map="auto", 
-                                                     load_in_4bit = True,
+                                                     load_in_4bit = True if bits == 4 else False,  # Don't know if we should save the final result in lesser bits
+                                                     load_in_8bit = True if bits == 8 else False,  # But why not?
                                                      torch_dtype=torch.bfloat16)
     model = model.merge_and_unload()
 
